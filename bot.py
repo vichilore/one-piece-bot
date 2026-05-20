@@ -8,9 +8,8 @@ from curl_cffi import requests as requests_cffi
 import threading
 from flask import Flask
 import time
-import random
 
-# ================= 0. SERVER WEB & AUTO-PING (KEEP-ALIVE RENDER) =================
+# ================= 0. SERVER WEB & KEEP-ALIVE =================
 app = Flask('')
 
 @app.route('/')
@@ -38,22 +37,7 @@ def keep_alive():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
-# ================= 1. GESTORE PROXY PUBBLICI ROTANTI =================
-def ottieni_lista_proxies():
-    """Scarica un blocco di proxy una volta sola per velocizzare le chiamate"""
-    url_lista = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all"
-    try:
-        response = requests_cffi.get(url_lista, timeout=8)
-        if response.status_code == 200 and response.text:
-            lista = response.text.strip().split("\r\n")
-            if len(lista) < 2:
-                lista = response.text.strip().split("\n")
-            return [p.strip() for p in lista if p.strip()]
-    except Exception as e:
-        print(f"⚠️ [PROXY] Errore download lista proxy: {e}")
-    return []
-
-# ================= 2. CONFIGURAZIONE BOT DISCORD =================
+# ================= 1. CONFIGURAZIONE BOT DISCORD =================
 TOKEN = os.environ.get("DISCORD_TOKEN")
 DB_FILE = "bot_data.json"
 
@@ -82,7 +66,7 @@ class MultiSniperBot(commands.Bot):
     async def on_ready(self):
         print(f"Bot connesso correttamente come {self.user}")
 
-    # ================= MOTORi DI SCRAPING =================
+    # ================= NUOVI MOTORI DI SCRAPING IMMUNI AI BLOCCHI =================
 
     def scrape_vinted(self, query):
         try:
@@ -92,73 +76,105 @@ class MultiSniperBot(commands.Bot):
             print(f"⚠️ [VINTED] Errore o blocco DataDome: {e}")
             return []
 
-    def scrape_wallapop(self, query, proxy_str):
-        url = "https://api.wallapop.com/api/v3/general/search"
-        params = {
-            "keywords": query,
-            "latitude": "41.89193",
-            "longitude": "12.51133",
-            "order_by": "newest"
-        }
+    def scrape_wallapop(self, query):
+        """Estrae i dati dal blocco JSON nativo della pagina web, aggirando i blocchi API"""
+        url = f"https://it.wallapop.com/app/search?keywords={query.replace(' ', '%20')}&order_by=newest"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Device-OS": "web",
-            "Accept": "application/json"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"
         }
-        proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"} if proxy_str else None
-        try:
-            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", proxies=proxies, timeout=8)
-            if response.status_code == 200:
-                return response.json().get("search_objects", [])
-            return []
-        except:
-            return []
-
-    def scrape_ebay(self, query, proxy_str):
-        url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_ipg=25"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-        }
-        proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"} if proxy_str else None
         items = []
         try:
-            response = requests_cffi.get(url, headers=headers, impersonate="chrome", proxies=proxies, timeout=8)
+            response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
             if response.status_code != 200:
+                print(f"❌ [WALLAPOP] Errore di caricamento pagina: {response.status_code}")
                 return []
             
             soup = BeautifulSoup(response.text, "html.parser")
-            listings = soup.find_all("li", class_=lambda x: x and "s-item" in x)
+            # Wallapop nasconde tutti i dati degli annunci in questo tag script specifico
+            script_tag = soup.find("script", id="__NEXT_DATA__")
+            
+            if script_tag:
+                json_data = json.loads(script_tag.string)
+                # Navighiamo all'interno dell'albero JSON di Next.js per trovare i prodotti
+                search_results = json_data.get("props", {}).get("pageProps", {}).get("searchResults", {})
+                objects = search_results.get("elements", [])
+                
+                for obj in objects:
+                    # Estraiamo solo i dati essenziali normalizzandoli
+                    if "id" in obj:
+                        items.append({
+                            "id": obj["id"],
+                            "title": obj.get("title", "Oggetto Wallapop"),
+                            "price": float(obj.get("price", 0)),
+                            "url": f"https://it.wallapop.com/item/{obj.get('webSlug')}",
+                            "image": obj.get("images", [{}])[0].get("original") if obj.get("images") else None
+                        })
+            return items
+        except Exception as e:
+            print(f"⚠️ [WALLAPOP] Errore estrazione NEXT_DATA: {e}")
+            return []
+
+    def scrape_ebay(self, query):
+        """Sfrutta il feed RSS ufficiale di eBay. Niente layout HTML, zero blocchi 403 dalle VPS"""
+        url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_rss=1"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        items = []
+        try:
+            response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
+            if response.status_code != 200:
+                print(f"❌ [EBAY] Errore Feed RSS: {response.status_code}")
+                return []
+            
+            # Utilizziamo il parser XML nativo per estrarre i tag strutturati
+            soup = BeautifulSoup(response.text, "xml")
+            listings = soup.find_all("item")
             
             for listing in listings:
-                title_elem = listing.find("div", class_="s-item__title")
-                price_elem = listing.find("span", class_="s-item__price")
-                link_elem = listing.find("a", class_="s-item__link")
-                img_elem = listing.find("img")
+                title_elem = listing.find("title")
+                link_elem = listing.find("link")
                 
-                if title_elem and price_elem and link_elem:
+                # Nei feed RSS di eBay, il prezzo è inserito in modo pulito in questi tag personalizzati
+                price_elem = listing.find("g-core:price") or listing.find("price")
+                
+                if title_elem and link_elem:
                     title = title_elem.text.strip()
-                    if "Risultati corrispondenti a meno parole" in title or "🤖" in title or "Shop on eBay" in title: 
+                    link = link_elem.text.strip()
+                    
+                    if "Risultati corrispondenti a meno parole" in title:
                         continue
                     
-                    price_str = price_elem.text.replace("EUR", "").replace(",", ".").replace(" ", "").strip()
-                    if "a" in price_str: 
-                        price_str = price_str.split("a")[0].strip()
+                    price = 0.0
+                    if price_elem:
+                        try:
+                            price = float(price_elem.text.replace(",", ".").strip())
+                        except:
+                            continue
+                    else:
+                        # Fallback se il tag fallisce: lo estraiamo dal testo della descrizione
+                        desc = listing.find("description").text if listing.find("description") else ""
+                        if "EUR" in desc:
+                            try:
+                                price_str = desc.split("EUR")[1].split("<")[0].strip().replace(",", ".")
+                                price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
+                            except:
+                                continue
                     
-                    try:
-                        price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
-                        item_id = link_elem["href"].split("?")[0].split("/")[-1]
+                    if price > 0:
+                        item_id = link.split("/")[-1].split("?")[0]
                         items.append({
                             "id": item_id,
                             "title": title,
                             "price": price,
-                            "url": link_elem["href"].split("?")[0],
-                            "image": img_elem["src"] if img_elem else None
+                            "url": link,
+                            "image": None
                         })
-                    except ValueError:
-                        continue
             return items
-        except:
+        except Exception as e:
+            print(f"⚠️ [EBAY] Errore lettura Feed XML: {e}")
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
@@ -172,9 +188,6 @@ class MultiSniperBot(commands.Bot):
             return
 
         visti_set = set(data["visti"])
-        
-        # Scarica un pool di proxy freschi all'inizio del ciclo di scansione
-        pool_proxies = ottieni_lista_proxies()
 
         for target in data["targets"]:
             query = target["query"]
@@ -191,24 +204,16 @@ class MultiSniperBot(commands.Bot):
                     await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
                     visti_set.add(item_id)
 
-            # Scegliamo un proxy casuale dal pool per Wallapop ed eBay
-            p_wallapop = random.choice(pool_proxies) if pool_proxies else None
-            p_ebay = random.choice(pool_proxies) if pool_proxies else None
-
             # --- 2. SCAN WALLAPOP ---
-            wallapop_items = self.scrape_wallapop(query, p_wallapop)
+            wallapop_items = self.scrape_wallapop(query)
             for item in wallapop_items:
-                if not item.get("id"): continue
                 item_id = f"wallapop_{item['id']}"
-                price = float(item.get("price", {}).get("amount", 9999))
-                if item_id not in visti_set and price <= max_price:
-                    url = f"https://it.wallapop.com/item/{item['web_slug']}"
-                    img = item.get("images", [{}])[0].get("original")
-                    await self.invia_notifica(channel, item.get("title"), price, url, "Wallapop", max_price, img)
+                if item_id not in visti_set and item["price"] <= max_price:
+                    await self.invia_notifica(channel, item["title"], item["price"], item["url"], "Wallapop", max_price, item["image"])
                     visti_set.add(item_id)
 
             # --- 3. SCAN EBAY ---
-            ebay_items = self.scrape_ebay(query, p_ebay)
+            ebay_items = self.scrape_ebay(query)
             for item in ebay_items:
                 item_id = f"ebay_{item['id']}"
                 if item_id not in visti_set and item["price"] <= max_price:
@@ -241,10 +246,10 @@ class MultiSniperBot(commands.Bot):
 
 bot = MultiSniperBot()
 
-# ================= 3. SLASH COMMANDS CORAZZATI (CON DEFER) =================
+# ================= 3. SLASH COMMANDS =================
 @bot.tree.command(name="set_canale", description="Imposta il canale per ricevere i ping.")
 async def set_canale(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True) # Dice a Discord di aspettare, prevenendo il timeout
+    await interaction.response.defer(ephemeral=True)
     data["channel_id"] = interaction.channel_id
     salva_data()
     await interaction.followup.send(f"✅ Canale impostato su <#{interaction.channel_id}>!")
