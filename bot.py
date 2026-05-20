@@ -156,6 +156,7 @@ class MultiSniperBot(commands.Bot):
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
+    # ================= LOOP DI MONITORAGGIO PRINCIPALE BLINDATO =================
     @tasks.loop(minutes=5)
     async def scrpe_loop(self):
         if not data["channel_id"] or not data["targets"]:
@@ -170,38 +171,45 @@ class MultiSniperBot(commands.Bot):
         for target in data["targets"]:
             query = target["query"]
             max_price = target["max_price"]
-            print(f"🕵️ Scanning: '{query}' (Max: €{max_price}) su Vinted, Wallapop, eBay...")
+            print(f"🕵️ Scanning globale per: '{query}' (Soglia: €{max_price})")
 
-            # --- 1. SCAN VINTED ---
-            vinted_items = self.scrape_vinted(query)
-            for item in vinted_items:
-                item_id = f"vinted_{item.id}"
-                if item_id not in visti_set and float(item.price) <= max_price:
-                    url = item.url if item.url.startswith("http") else f"https://www.vinted.it{item.url}"
-                    img = item.photos[0].url if item.photos else None
-                    await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
-                    visti_set.add(item_id)
+            # --- 1. PROCESSO VINTED (ISOLATO) ---
+            try:
+                vinted_items = self.scrape_vinted(query)
+                for item in vinted_items:
+                    item_id = f"vinted_{item.id}"
+                    if item_id not in visti_set and float(item.price) <= max_price:
+                        url = item.url if item.url.startswith("http") else f"https://www.vinted.it{item.url}"
+                        img = item.photos[0].url if item.photos else None
+                        await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
+                        visti_set.add(item_id)
+            except Exception as e:
+                print(f"❌ [LOOP CRASH] Saltato modulo Vinted per questa query: {e}")
 
-            # --- 2. SCAN WALLAPOP ---
-            wallapop_items = self.scrape_wallapop(query)
-            for item in wallapop_items:
-                if not item.get("id"): continue
-                item_id = f"wallapop_{item['id']}"
-                price = float(item.get("price", {}).get("amount", 9999))
-                if item_id not in visti_set and price <= max_price:
-                    url = f"https://it.wallapop.com/item/{item['web_slug']}"
-                    img = item.get("images", [{}])[0].get("original") if item.get("images") else None
-                    await self.invia_notifica(channel, item.get("title"), price, url, "Wallapop", max_price, img)
-                    visti_set.add(item_id)
+            # --- 2. PROCESSO WALLAPOP (ISOLATO) ---
+            try:
+                wallapop_items = self.scrape_wallapop(query)
+                for item in wallapop_items:
+                    if not item.get("id"): continue
+                    item_id = f"wallapop_{item['id']}"
+                    if item_id not in visti_set and item["price"] <= max_price:
+                        await self.invia_notifica(channel, item["title"], item["price"], item["url"], "Wallapop", max_price, item["image"])
+                        visti_set.add(item_id)
+            except Exception as e:
+                print(f"❌ [LOOP CRASH] Saltato modulo Wallapop per questa query: {e}")
 
-            # --- 3. SCAN EBAY ---
-            ebay_items = self.scrape_ebay(query)
-            for item in ebay_items:
-                item_id = f"ebay_{item['id']}"
-                if item_id not in visti_set and item["price"] <= max_price:
-                    await self.invia_notifica(channel, item["title"], item["price"], item["url"], "eBay", max_price, item["image"])
-                    visti_set.add(item_id)
+            # --- 3. PROCESSO EBAY (ISOLATO) ---
+            try:
+                ebay_items = self.scrape_ebay(query)
+                for item in ebay_items:
+                    item_id = f"ebay_{item['id']}"
+                    if item_id not in visti_set and item["price"] <= max_price:
+                        await self.invia_notifica(channel, item["title"], item["price"], item["url"], "eBay", max_price, item["image"])
+                        visti_set.add(item_id)
+            except Exception as e:
+                print(f"❌ [LOOP CRASH] Saltato modulo eBay per questa query: {e}")
 
+        # Aggiorna lo stato della memoria globale
         data["visti"] = list(visti_set)
         salva_data()
 
