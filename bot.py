@@ -8,6 +8,7 @@ from curl_cffi import requests as requests_cffi
 import threading
 from flask import Flask
 import time
+import random
 
 # ================= 0. SERVER WEB & AUTO-PING (KEEP-ALIVE RENDER) =================
 app = Flask('')
@@ -21,36 +22,45 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 def self_ping_loop():
-    """Invia una richiesta HTTP all'URL del bot stesso per evitare lo sleep di Render"""
-    # Aspettiamo 30 secondi all'avvio per dare tempo al server di alzarsi
     time.sleep(30)
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    
     if not render_url:
-        print("⚠️ RENDER_EXTERNAL_URL non configurata. L'auto-ping locale simulerà i passaggi.")
         render_url = "http://localhost:8080"
-
     while True:
         try:
-            # Mandiamo un ping web ogni 5 minuti (300 secondi)
             res = requests_cffi.get(render_url, timeout=10)
-            print(f"⏰ [KEEP-ALIVE] Ping inviato con successo a {render_url}. Status: {res.status_code}")
+            print(f"⏰ [KEEP-ALIVE] Ping inviato. Status: {res.status_code}")
         except Exception as e:
-            print(f"⚠️ [KEEP-ALIVE] Errore durante l'auto-ping: {e}")
+            print(f"⚠️ [KEEP-ALIVE] Errore auto-ping: {e}")
         time.sleep(300)
 
 def keep_alive():
-    # Thread per il server Flask
-    t_flask = threading.Thread(target=run_flask)
-    t_flask.daemon = True
-    t_flask.start()
-    
-    # Thread per l'auto-ping continuo
-    t_ping = threading.Thread(target=self_ping_loop)
-    t_ping.daemon = True
-    t_ping.start()
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
 
-# ================= 1. DATABASE E CONFIGURAZIONE BOT =================
+# ================= 1. GESTORE PROXY PUBBLICI ROTANTI =================
+def ottieni_proxy_funzionante():
+    """Preleva un proxy HTTP/HTTPS fresco da liste pubbliche per aggirare il 403"""
+    url_lista = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"
+    try:
+        response = requests_cffi.get(url_lista, timeout=10)
+        if response.status_code == 200 and response.text:
+            lista_proxies = response.text.strip().split("\r\n")
+            if not lista_proxies or len(lista_proxies) < 2:
+                lista_proxies = response.text.strip().split("\n")
+            
+            # Ne scegliamo uno a caso dalla lista
+            proxy_scelto = random.choice(lista_proxies).strip()
+            print(f"📡 [PROXY] Estratto nuovo IP rotante: {proxy_scelto}")
+            return {
+                "http": f"http://{proxy_scelto}",
+                "https": f"http://{proxy_scelto}"
+            }
+    except Exception as e:
+        print(f"⚠️ [PROXY] Impossibile recuperare la lista proxy: {e}")
+    return None
+
+# ================= 2. CONFIGURAZIONE BOT DISCORD =================
 TOKEN = os.environ.get("DISCORD_TOKEN")
 DB_FILE = "bot_data.json"
 
@@ -79,7 +89,7 @@ class MultiSniperBot(commands.Bot):
     async def on_ready(self):
         print(f"Bot connesso correttamente come {self.user}")
 
-    # ================= LOOPS DI SCRAPING SPECIFICI =================
+    # ================= MOTORi DI SCRAPING CON ABBATTIMENTO FIREWALL =================
 
     def scrape_vinted(self, query):
         try:
@@ -99,28 +109,35 @@ class MultiSniperBot(commands.Bot):
         }
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Device-OS": "web"
+            "Device-OS": "web",
+            "Accept": "application/json"
         }
+        
+        # Recuperiamo un IP vergine per questa chiamata
+        proxy = ottieni_proxy_funzionante()
         try:
-            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", timeout=10)
+            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", proxies=proxy, timeout=12)
             if response.status_code == 200:
                 return response.json().get("search_objects", [])
-            print(f"❌ debug [WALLAPOP]: Errore HTTP {response.status_code}")
+            print(f"❌ [WALLAPOP] Fallito con proxy. Status: {response.status_code}")
             return []
         except Exception as e:
-            print(f"⚠️ [WALLAPOP] Errore API: {e}")
+            print(f"⚠️ [WALLAPOP] Timeout o errore di rete proxy: {e}")
             return []
 
     def scrape_ebay(self, query):
         url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_ipg=25"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
         }
+        
+        proxy = ottieni_proxy_funzionante()
         items = []
         try:
-            response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
+            response = requests_cffi.get(url, headers=headers, impersonate="chrome", proxies=proxy, timeout=12)
             if response.status_code != 200:
-                print(f"❌ debug [EBAY]: Errore HTTP {response.status_code}")
+                print(f"❌ [EBAY] Fallito con proxy. Status: {response.status_code}")
                 return []
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -155,7 +172,7 @@ class MultiSniperBot(commands.Bot):
                         continue
             return items
         except Exception as e:
-            print(f"⚠️ [EBAY] Errore Scraping: {e}")
+            print(f"⚠️ [EBAY] Errore di connessione proxy: {e}")
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
@@ -175,7 +192,7 @@ class MultiSniperBot(commands.Bot):
             max_price = target["max_price"]
             print(f"🕵️ Scanning: '{query}' (Max: €{max_price}) su Vinted, Wallapop, eBay...")
 
-            # --- VINTED ---
+            # --- 1. SCAN VINTED ---
             vinted_items = self.scrape_vinted(query)
             for item in vinted_items:
                 item_id = f"vinted_{item.id}"
@@ -185,7 +202,7 @@ class MultiSniperBot(commands.Bot):
                     await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
                     visti_set.add(item_id)
 
-            # --- WALLAPOP ---
+            # --- 2. SCAN WALLAPOP ---
             wallapop_items = self.scrape_wallapop(query)
             for item in wallapop_items:
                 if not item.get("id"): continue
@@ -197,7 +214,7 @@ class MultiSniperBot(commands.Bot):
                     await self.invia_notifica(channel, item.get("title"), price, url, "Wallapop", max_price, img)
                     visti_set.add(item_id)
 
-            # --- EBAY ---
+            # --- 3. SCAN EBAY ---
             ebay_items = self.scrape_ebay(query)
             for item in ebay_items:
                 item_id = f"ebay_{item['id']}"
@@ -231,7 +248,7 @@ class MultiSniperBot(commands.Bot):
 
 bot = MultiSniperBot()
 
-# ================= 2. SLASH COMMANDS =================
+# ================= 3. SLASH COMMANDS =================
 @bot.tree.command(name="set_canale", description="Imposta il canale per ricevere i ping.")
 async def set_canale(interaction: discord.Interaction):
     data["channel_id"] = interaction.channel_id
@@ -259,7 +276,7 @@ async def svuota_target(interaction: discord.Interaction):
     salva_data()
     await interaction.response.send_message("🗑️ Tutti i target sono stati rimossi con successo.")
 
-# ================= 3. RUN =================
+# ================= 4. RUN =================
 if __name__ == "__main__":
-    keep_alive()  # Fa partire Flask e l'Auto-Ping nei thread in background
+    keep_alive()
     bot.run(TOKEN)
