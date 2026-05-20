@@ -8,6 +8,7 @@ from curl_cffi import requests as requests_cffi
 import threading
 from flask import Flask
 import time
+import re
 
 # ================= 0. SERVER WEB & KEEP-ALIVE =================
 app = Flask('')
@@ -66,7 +67,7 @@ class MultiSniperBot(commands.Bot):
     async def on_ready(self):
         print(f"Bot connesso correttamente come {self.user}")
 
-    # ================= NUOVI MOTORI DI SCRAPING IMMUNI AI BLOCCHI =================
+    # ================= PARSER REVISIONATI E OTTIMIZZATI =================
 
     def scrape_vinted(self, query):
         try:
@@ -77,104 +78,81 @@ class MultiSniperBot(commands.Bot):
             return []
 
     def scrape_wallapop(self, query):
-        """Estrae i dati dal blocco JSON nativo della pagina web, aggirando i blocchi API"""
-        url = f"https://it.wallapop.com/app/search?keywords={query.replace(' ', '%20')}&order_by=newest"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"
+        """Usa l'endpoint consumer mobile-web, molto meno protetto di quello desktop"""
+        url = "https://api.wallapop.com/api/v3/general/search"
+        params = {
+            "keywords": query,
+            "filters_source": "search_box",
+            "order_by": "newest"
         }
-        items = []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json",
+            "Device-OS": "ios"
+        }
         try:
-            response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
-            if response.status_code != 200:
-                print(f"❌ [WALLAPOP] Errore di caricamento pagina: {response.status_code}")
-                return []
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            # Wallapop nasconde tutti i dati degli annunci in questo tag script specifico
-            script_tag = soup.find("script", id="__NEXT_DATA__")
-            
-            if script_tag:
-                json_data = json.loads(script_tag.string)
-                # Navighiamo all'interno dell'albero JSON di Next.js per trovare i prodotti
-                search_results = json_data.get("props", {}).get("pageProps", {}).get("searchResults", {})
-                objects = search_results.get("elements", [])
-                
-                for obj in objects:
-                    # Estraiamo solo i dati essenziali normalizzandoli
-                    if "id" in obj:
-                        items.append({
-                            "id": obj["id"],
-                            "title": obj.get("title", "Oggetto Wallapop"),
-                            "price": float(obj.get("price", 0)),
-                            "url": f"https://it.wallapop.com/item/{obj.get('webSlug')}",
-                            "image": obj.get("images", [{}])[0].get("original") if obj.get("images") else None
-                        })
-            return items
+            response = requests_cffi.get(url, params=params, headers=headers, impersonate="safari_ios", timeout=10)
+            if response.status_code == 200:
+                print(f"✅ [WALLAPOP] Connessione riuscita. Analizzo i dati...")
+                return response.json().get("search_objects", [])
+            print(f"❌ [WALLAPOP] Rifiutato con codice: {response.status_code}")
+            return []
         except Exception as e:
-            print(f"⚠️ [WALLAPOP] Errore estrazione NEXT_DATA: {e}")
+            print(f"⚠️ [WALLAPOP] Errore di rete: {e}")
             return []
 
     def scrape_ebay(self, query):
-        """Sfrutta il feed RSS ufficiale di eBay. Niente layout HTML, zero blocchi 403 dalle VPS"""
-        url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_rss=1"
+        """Estrae i dati tramite Regex sulla pagina HTML per saltare i blocchi delle classi CSS"""
+        url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_ipg=25"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "it-IT,it;q=0.9"
         }
         items = []
         try:
             response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
             if response.status_code != 200:
-                print(f"❌ [EBAY] Errore Feed RSS: {response.status_code}")
+                print(f"❌ [EBAY] Errore di caricamento pagina: {response.status_code}")
                 return []
             
-            # Utilizziamo il parser XML nativo per estrarre i tag strutturati
-            soup = BeautifulSoup(response.text, "xml")
-            listings = soup.find_all("item")
+            soup = BeautifulSoup(response.text, "html.parser")
+            # Cerchiamo tutti i blocchi d'inserzione generici
+            listings = soup.find_all("li", class_=lambda x: x and "s-item" in x)
             
             for listing in listings:
-                title_elem = listing.find("title")
-                link_elem = listing.find("link")
+                title_elem = listing.find("div", class_="s-item__title") or listing.find("h3")
+                price_elem = listing.find("span", class_="s-item__price")
+                link_elem = listing.find("a", class_="s-item__link")
                 
-                # Nei feed RSS di eBay, il prezzo è inserito in modo pulito in questi tag personalizzati
-                price_elem = listing.find("g-core:price") or listing.find("price")
-                
-                if title_elem and link_elem:
+                if title_elem and price_elem and link_elem:
                     title = title_elem.text.strip()
-                    link = link_elem.text.strip()
-                    
-                    if "Risultati corrispondenti a meno parole" in title:
+                    if "Risultati corrispondenti" in title or "Shop on eBay" in title:
                         continue
-                    
-                    price = 0.0
-                    if price_elem:
-                        try:
-                            price = float(price_elem.text.replace(",", ".").strip())
-                        except:
-                            continue
-                    else:
-                        # Fallback se il tag fallisce: lo estraiamo dal testo della descrizione
-                        desc = listing.find("description").text if listing.find("description") else ""
-                        if "EUR" in desc:
-                            try:
-                                price_str = desc.split("EUR")[1].split("<")[0].strip().replace(",", ".")
-                                price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
-                            except:
-                                continue
-                    
-                    if price > 0:
-                        item_id = link.split("/")[-1].split("?")[0]
+                        
+                    price_str = price_elem.text.replace("EUR", "").replace(",", ".").replace(" ", "").strip()
+                    if "a" in price_str:
+                        price_str = price_str.split("a")[0].strip()
+                        
+                    try:
+                        # Estrae solo i numeri e il punto decimale
+                        price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
+                        link_pulito = link_elem["href"].split("?")[0]
+                        item_id = link_pulito.split("/")[-1]
+                        
                         items.append({
                             "id": item_id,
                             "title": title,
                             "price": price,
-                            "url": link,
+                            "url": link_pulito,
                             "image": None
                         })
+                    except ValueError:
+                        continue
+            print(f"✅ [EBAY] Scansione completata. Trovati {len(items)} oggetti.")
             return items
         except Exception as e:
-            print(f"⚠️ [EBAY] Errore lettura Feed XML: {e}")
+            print(f"⚠️ [EBAY] Errore durante lo scraping: {e}")
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
@@ -207,9 +185,13 @@ class MultiSniperBot(commands.Bot):
             # --- 2. SCAN WALLAPOP ---
             wallapop_items = self.scrape_wallapop(query)
             for item in wallapop_items:
+                if not item.get("id"): continue
                 item_id = f"wallapop_{item['id']}"
-                if item_id not in visti_set and item["price"] <= max_price:
-                    await self.invia_notifica(channel, item["title"], item["price"], item["url"], "Wallapop", max_price, item["image"])
+                price = float(item.get("price", {}).get("amount", 9999))
+                if item_id not in visti_set and price <= max_price:
+                    url = f"https://it.wallapop.com/item/{item['web_slug']}"
+                    img = item.get("images", [{}])[0].get("original") if item.get("images") else None
+                    await self.invia_notifica(channel, item.get("title"), price, url, "Wallapop", max_price, img)
                     visti_set.add(item_id)
 
             # --- 3. SCAN EBAY ---
