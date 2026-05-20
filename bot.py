@@ -39,26 +39,19 @@ def keep_alive():
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
 # ================= 1. GESTORE PROXY PUBBLICI ROTANTI =================
-def ottieni_proxy_funzionante():
-    """Preleva un proxy HTTP/HTTPS fresco da liste pubbliche per aggirare il 403"""
-    url_lista = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"
+def ottieni_lista_proxies():
+    """Scarica un blocco di proxy una volta sola per velocizzare le chiamate"""
+    url_lista = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all"
     try:
-        response = requests_cffi.get(url_lista, timeout=10)
+        response = requests_cffi.get(url_lista, timeout=8)
         if response.status_code == 200 and response.text:
-            lista_proxies = response.text.strip().split("\r\n")
-            if not lista_proxies or len(lista_proxies) < 2:
-                lista_proxies = response.text.strip().split("\n")
-            
-            # Ne scegliamo uno a caso dalla lista
-            proxy_scelto = random.choice(lista_proxies).strip()
-            print(f"📡 [PROXY] Estratto nuovo IP rotante: {proxy_scelto}")
-            return {
-                "http": f"http://{proxy_scelto}",
-                "https": f"http://{proxy_scelto}"
-            }
+            lista = response.text.strip().split("\r\n")
+            if len(lista) < 2:
+                lista = response.text.strip().split("\n")
+            return [p.strip() for p in lista if p.strip()]
     except Exception as e:
-        print(f"⚠️ [PROXY] Impossibile recuperare la lista proxy: {e}")
-    return None
+        print(f"⚠️ [PROXY] Errore download lista proxy: {e}")
+    return []
 
 # ================= 2. CONFIGURAZIONE BOT DISCORD =================
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -89,7 +82,7 @@ class MultiSniperBot(commands.Bot):
     async def on_ready(self):
         print(f"Bot connesso correttamente come {self.user}")
 
-    # ================= MOTORi DI SCRAPING CON ABBATTIMENTO FIREWALL =================
+    # ================= MOTORi DI SCRAPING =================
 
     def scrape_vinted(self, query):
         try:
@@ -99,7 +92,7 @@ class MultiSniperBot(commands.Bot):
             print(f"⚠️ [VINTED] Errore o blocco DataDome: {e}")
             return []
 
-    def scrape_wallapop(self, query):
+    def scrape_wallapop(self, query, proxy_str):
         url = "https://api.wallapop.com/api/v3/general/search"
         params = {
             "keywords": query,
@@ -112,32 +105,26 @@ class MultiSniperBot(commands.Bot):
             "Device-OS": "web",
             "Accept": "application/json"
         }
-        
-        # Recuperiamo un IP vergine per questa chiamata
-        proxy = ottieni_proxy_funzionante()
+        proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"} if proxy_str else None
         try:
-            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", proxies=proxy, timeout=12)
+            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", proxies=proxies, timeout=8)
             if response.status_code == 200:
                 return response.json().get("search_objects", [])
-            print(f"❌ [WALLAPOP] Fallito con proxy. Status: {response.status_code}")
             return []
-        except Exception as e:
-            print(f"⚠️ [WALLAPOP] Timeout o errore di rete proxy: {e}")
+        except:
             return []
 
-    def scrape_ebay(self, query):
+    def scrape_ebay(self, query, proxy_str):
         url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_ipg=25"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
         }
-        
-        proxy = ottieni_proxy_funzionante()
+        proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"} if proxy_str else None
         items = []
         try:
-            response = requests_cffi.get(url, headers=headers, impersonate="chrome", proxies=proxy, timeout=12)
+            response = requests_cffi.get(url, headers=headers, impersonate="chrome", proxies=proxies, timeout=8)
             if response.status_code != 200:
-                print(f"❌ [EBAY] Fallito con proxy. Status: {response.status_code}")
                 return []
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -171,8 +158,7 @@ class MultiSniperBot(commands.Bot):
                     except ValueError:
                         continue
             return items
-        except Exception as e:
-            print(f"⚠️ [EBAY] Errore di connessione proxy: {e}")
+        except:
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
@@ -186,6 +172,9 @@ class MultiSniperBot(commands.Bot):
             return
 
         visti_set = set(data["visti"])
+        
+        # Scarica un pool di proxy freschi all'inizio del ciclo di scansione
+        pool_proxies = ottieni_lista_proxies()
 
         for target in data["targets"]:
             query = target["query"]
@@ -202,8 +191,12 @@ class MultiSniperBot(commands.Bot):
                     await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
                     visti_set.add(item_id)
 
+            # Scegliamo un proxy casuale dal pool per Wallapop ed eBay
+            p_wallapop = random.choice(pool_proxies) if pool_proxies else None
+            p_ebay = random.choice(pool_proxies) if pool_proxies else None
+
             # --- 2. SCAN WALLAPOP ---
-            wallapop_items = self.scrape_wallapop(query)
+            wallapop_items = self.scrape_wallapop(query, p_wallapop)
             for item in wallapop_items:
                 if not item.get("id"): continue
                 item_id = f"wallapop_{item['id']}"
@@ -215,7 +208,7 @@ class MultiSniperBot(commands.Bot):
                     visti_set.add(item_id)
 
             # --- 3. SCAN EBAY ---
-            ebay_items = self.scrape_ebay(query)
+            ebay_items = self.scrape_ebay(query, p_ebay)
             for item in ebay_items:
                 item_id = f"ebay_{item['id']}"
                 if item_id not in visti_set and item["price"] <= max_price:
@@ -248,33 +241,37 @@ class MultiSniperBot(commands.Bot):
 
 bot = MultiSniperBot()
 
-# ================= 3. SLASH COMMANDS =================
+# ================= 3. SLASH COMMANDS CORAZZATI (CON DEFER) =================
 @bot.tree.command(name="set_canale", description="Imposta il canale per ricevere i ping.")
 async def set_canale(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True) # Dice a Discord di aspettare, prevenendo il timeout
     data["channel_id"] = interaction.channel_id
     salva_data()
-    await interaction.response.send_message(f"✅ Canale impostato su <#{interaction.channel_id}>!", ephemeral=True)
+    await interaction.followup.send(f"✅ Canale impostato su <#{interaction.channel_id}>!")
 
 @bot.tree.command(name="aggiungi_target", description="Aggiunge un prodotto da monitorare su tutti i siti.")
 async def aggiungi_target(interaction: discord.Interaction, query: str, max_price: float):
+    await interaction.response.defer()
     nuovo_target = {"query": query.lower(), "max_price": max_price}
     data["targets"].append(nuovo_target)
     salva_data()
-    await interaction.response.send_message(f"🔍 Avviato monitoraggio globale per: **{query}** (Prezzo ≤ **€ {max_price}**)")
+    await interaction.followup.send(f"🔍 Avviato monitoraggio globale per: **{query}** (Prezzo ≤ **€ {max_price}**)")
 
 @bot.tree.command(name="lista_target", description="Mostra la lista dei prodotti.")
 async def lista_target(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     if not data["targets"]:
-        await interaction.response.send_message("Nessun target impostato.", ephemeral=True)
+        await interaction.followup.send("Nessun target impostato.")
         return
     lista_testo = "\n".join([f"• **{t['query']}** (Max: € {t['max_price']})" for t in data["targets"]])
-    await interaction.response.send_message(f"📋 **Target attivi:**\n{lista_testo}", ephemeral=True)
+    await interaction.followup.send(f"📋 **Target attivi:**\n{lista_testo}")
 
 @bot.tree.command(name="svuota_target", description="Svuota tutti i prodotti in monitoraggio.")
 async def svuota_target(interaction: discord.Interaction):
+    await interaction.response.defer()
     data["targets"] = []
     salva_data()
-    await interaction.response.send_message("🗑️ Tutti i target sono stati rimossi con successo.")
+    await interaction.followup.send("🗑️ Tutti i target sono stati rimossi con successo.")
 
 # ================= 4. RUN =================
 if __name__ == "__main__":
