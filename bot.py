@@ -8,7 +8,7 @@ from curl_cffi import requests as requests_cffi
 import threading
 from flask import Flask
 import time
-import re
+import urllib.parse
 
 # ================= 0. SERVER WEB & KEEP-ALIVE =================
 app = Flask('')
@@ -29,9 +29,9 @@ def self_ping_loop():
     while True:
         try:
             res = requests_cffi.get(render_url, timeout=10)
-            print(f"⏰ [KEEP-ALIVE] Ping inviato. Status: {res.status_code}")
+            print(f"⏰ [KEEP-ALIVE] Ping inviato. Status: {res.status_code}", flush=True)
         except Exception as e:
-            print(f"⚠️ [KEEP-ALIVE] Errore auto-ping: {e}")
+            print(f"⚠️ [KEEP-ALIVE] Errore auto-ping: {e}", flush=True)
         time.sleep(300)
 
 def keep_alive():
@@ -40,6 +40,7 @@ def keep_alive():
 
 # ================= 1. CONFIGURAZIONE BOT DISCORD =================
 TOKEN = os.environ.get("DISCORD_TOKEN")
+SCRAPE_DO_TOKEN = os.environ.get("SCRAPE_DO_TOKEN") # Il token per distruggere i 403
 DB_FILE = "bot_data.json"
 
 if os.path.exists(DB_FILE):
@@ -62,62 +63,57 @@ class MultiSniperBot(commands.Bot):
     async def setup_hook(self):
         self.scrpe_loop.start()
         await self.tree.sync()
-        print("Slash commands sincronizzati.")
+        print("Slash commands sincronizzati.", flush=True)
 
     async def on_ready(self):
-        print(f"Bot connesso correttamente come {self.user}")
+        print(f"Bot connesso correttamente come {self.user}", flush=True)
 
-    # ================= PARSER REVISIONATI E OTTIMIZZATI =================
+    # ================= MOTORI DI SCRAPING BYPASS =================
 
     def scrape_vinted(self, query):
         try:
             scraper = VintedScraper("https://www.vinted.it")
             return scraper.search({"search_text": query, "order": "newest_first"})
         except Exception as e:
-            print(f"⚠️ [VINTED] Errore o blocco DataDome: {e}")
+            print(f"⚠️ [VINTED] Errore o blocco DataDome: {e}", flush=True)
             return []
 
     def scrape_wallapop(self, query):
-        """Usa l'endpoint consumer mobile-web, molto meno protetto di quello desktop"""
-        url = "https://api.wallapop.com/api/v3/general/search"
-        params = {
-            "keywords": query,
-            "filters_source": "search_box",
-            "order_by": "newest"
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-            "Accept": "application/json",
-            "Device-OS": "ios"
-        }
+        """Passa tramite il proxy residenziale di Scrape.do per aggirare Cloudflare"""
+        if not SCRAPE_DO_TOKEN:
+            print("⚠️ SCRAPE_DO_TOKEN mancante nelle variabili d'ambiente!", flush=True)
+            return []
+            
+        target_url = f"https://api.wallapop.com/api/v3/general/search?keywords={urllib.parse.quote(query)}&filters_source=search_box&order_by=newest"
+        # URL di Scrape.do che fa da scudo intermediario
+        api_url = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(target_url)}"
+        
         try:
-            response = requests_cffi.get(url, params=params, headers=headers, impersonate="safari_ios", timeout=10)
+            response = requests_cffi.get(api_url, timeout=15)
             if response.status_code == 200:
-                print(f"✅ [WALLAPOP] Connessione riuscita. Analizzo i dati...")
+                print(f"✅ [WALLAPOP] Proxy Residenziale Superato! Analizzo i dati...", flush=True)
                 return response.json().get("search_objects", [])
-            print(f"❌ [WALLAPOP] Rifiutato con codice: {response.status_code}")
+            print(f"❌ [WALLAPOP] Scrape.do ha risposto con codice: {response.status_code}", flush=True)
             return []
         except Exception as e:
-            print(f"⚠️ [WALLAPOP] Errore di rete: {e}")
+            print(f"⚠️ [WALLAPOP] Errore API Scrape.do: {e}", flush=True)
             return []
 
     def scrape_ebay(self, query):
-        """Estrae i dati tramite Regex sulla pagina HTML per saltare i blocchi delle classi CSS"""
-        url = f"https://www.ebay.it/sch/i.html?_nkw={query.replace(' ', '+')}&_sop=10&_ipg=25"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "it-IT,it;q=0.9"
-        }
+        """Passa tramite Scrape.do per caricare la pagina HTML di eBay senza 403"""
+        if not SCRAPE_DO_TOKEN:
+            return []
+            
+        target_url = f"https://www.ebay.it/sch/i.html?_nkw={urllib.parse.quote(query)}&_sop=10&_ipg=25"
+        api_url = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(target_url)}"
         items = []
         try:
-            response = requests_cffi.get(url, headers=headers, impersonate="chrome", timeout=10)
+            response = requests_cffi.get(api_url, timeout=15)
             if response.status_code != 200:
-                print(f"❌ [EBAY] Errore di caricamento pagina: {response.status_code}")
+                print(f"❌ [EBAY] Scrape.do ha risposto con codice: {response.status_code}", flush=True)
                 return []
             
             soup = BeautifulSoup(response.text, "html.parser")
-            # Cerchiamo tutti i blocchi d'inserzione generici
             listings = soup.find_all("li", class_=lambda x: x and "s-item" in x)
             
             for listing in listings:
@@ -135,7 +131,6 @@ class MultiSniperBot(commands.Bot):
                         price_str = price_str.split("a")[0].strip()
                         
                     try:
-                        # Estrae solo i numeri e il punto decimale
                         price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
                         link_pulito = link_elem["href"].split("?")[0]
                         item_id = link_pulito.split("/")[-1]
@@ -149,13 +144,12 @@ class MultiSniperBot(commands.Bot):
                         })
                     except ValueError:
                         continue
-            print(f"✅ [EBAY] Scansione completata. Trovati {len(items)} oggetti.")
+            print(f"✅ [EBAY] Scansione completata. Estratti {len(items)} oggetti.", flush=True)
             return items
         except Exception as e:
-            print(f"⚠️ [EBAY] Errore durante lo scraping: {e}")
+            print(f"⚠️ [EBAY] Errore Scrape.do: {e}", flush=True)
             return []
 
-    # ================= LOOP DI MONITORAGGIO PRINCIPALE =================
     # ================= LOOP DI MONITORAGGIO PRINCIPALE BLINDATO =================
     @tasks.loop(minutes=5)
     async def scrpe_loop(self):
@@ -171,9 +165,9 @@ class MultiSniperBot(commands.Bot):
         for target in data["targets"]:
             query = target["query"]
             max_price = target["max_price"]
-            print(f"🕵️ Scanning globale per: '{query}' (Soglia: €{max_price})")
+            print(f"🕵️ Scanning globale per: '{query}' (Soglia: €{max_price})", flush=True)
 
-            # --- 1. PROCESSO VINTED (ISOLATO) ---
+            # --- 1. PROCESSO VINTED ---
             try:
                 vinted_items = self.scrape_vinted(query)
                 for item in vinted_items:
@@ -184,9 +178,9 @@ class MultiSniperBot(commands.Bot):
                         await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Saltato modulo Vinted per questa query: {e}")
+                print(f"❌ [LOOP CRASH] Errore modulo Vinted: {e}", flush=True)
 
-            # --- 2. PROCESSO WALLAPOP (ISOLATO) ---
+            # --- 2. PROCESSO WALLAPOP ---
             try:
                 wallapop_items = self.scrape_wallapop(query)
                 for item in wallapop_items:
@@ -196,9 +190,9 @@ class MultiSniperBot(commands.Bot):
                         await self.invia_notifica(channel, item["title"], item["price"], item["url"], "Wallapop", max_price, item["image"])
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Saltato modulo Wallapop per questa query: {e}")
+                print(f"❌ [LOOP CRASH] Errore modulo Wallapop: {e}", flush=True)
 
-            # --- 3. PROCESSO EBAY (ISOLATO) ---
+            # --- 3. PROCESSO EBAY ---
             try:
                 ebay_items = self.scrape_ebay(query)
                 for item in ebay_items:
@@ -207,9 +201,8 @@ class MultiSniperBot(commands.Bot):
                         await self.invia_notifica(channel, item["title"], item["price"], item["url"], "eBay", max_price, item["image"])
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Saltato modulo eBay per questa query: {e}")
+                print(f"❌ [LOOP CRASH] Errore modulo eBay: {e}", flush=True)
 
-        # Aggiorna lo stato della memoria globale
         data["visti"] = list(visti_set)
         salva_data()
 
@@ -228,7 +221,7 @@ class MultiSniperBot(commands.Bot):
         try:
             await channel.send(embed=embed)
         except Exception as e:
-            print(f"Errore invio messaggio a Discord: {e}")
+            print(f"Errore invio messaggio a Discord: {e}", flush=True)
 
     @scrpe_loop.before_loop
     async def before_scrape_loop(self):
