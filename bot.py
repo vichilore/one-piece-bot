@@ -40,7 +40,6 @@ def keep_alive():
 
 # ================= 1. CONFIGURAZIONE BOT DISCORD =================
 TOKEN = os.environ.get("DISCORD_TOKEN")
-SCRAPE_DO_TOKEN = os.environ.get("SCRAPE_DO_TOKEN") # Il token per distruggere i 403
 DB_FILE = "bot_data.json"
 
 if os.path.exists(DB_FILE):
@@ -68,7 +67,7 @@ class MultiSniperBot(commands.Bot):
     async def on_ready(self):
         print(f"Bot connesso correttamente come {self.user}", flush=True)
 
-    # ================= MOTORI DI SCRAPING BYPASS =================
+    # ================= NUOVI MOTORI AD ALTA COMPATIBILITÀ CLOUD =================
 
     def scrape_vinted(self, query):
         try:
@@ -79,75 +78,75 @@ class MultiSniperBot(commands.Bot):
             return []
 
     def scrape_wallapop(self, query):
-        """Passa tramite il proxy residenziale di Scrape.do per aggirare Cloudflare"""
-        if not SCRAPE_DO_TOKEN:
-            print("⚠️ SCRAPE_DO_TOKEN mancante nelle variabili d'ambiente!", flush=True)
-            return []
-            
-        target_url = f"https://api.wallapop.com/api/v3/general/search?keywords={urllib.parse.quote(query)}&filters_source=search_box&order_by=newest"
-        # URL di Scrape.do che fa da scudo intermediario
-        api_url = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(target_url)}"
-        
+        """Interroga l'endpoint desktop aperto di Wallapop con timeout esteso"""
+        url = "https://api.wallapop.com/api/v3/general/search"
+        params = {
+            "keywords": query,
+            "order_by": "newest",
+            "source": "search_box"
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Device-OS": "web"
+        }
         try:
-            response = requests_cffi.get(api_url, timeout=15)
+            # Alziamo il timeout a 25 secondi per evitare i drop di connessione di Render
+            response = requests_cffi.get(url, params=params, headers=headers, impersonate="chrome", timeout=25)
             if response.status_code == 200:
-                print(f"✅ [WALLAPOP] Proxy Residenziale Superato! Analizzo i dati...", flush=True)
+                print(f"✅ [WALLAPOP] Dati estratti con successo.", flush=True)
                 return response.json().get("search_objects", [])
-            print(f"❌ [WALLAPOP] Scrape.do ha risposto con codice: {response.status_code}", flush=True)
+            print(f"❌ [WALLAPOP] Errore server: {response.status_code}", flush=True)
             return []
         except Exception as e:
-            print(f"⚠️ [WALLAPOP] Errore API Scrape.do: {e}", flush=True)
+            print(f"⚠️ [WALLAPOP] Timeout o errore: {e}", flush=True)
             return []
 
     def scrape_ebay(self, query):
-        """Passa tramite Scrape.do per caricare la pagina HTML di eBay senza 403"""
-        if not SCRAPE_DO_TOKEN:
-            return []
-            
-        target_url = f"https://www.ebay.it/sch/i.html?_nkw={urllib.parse.quote(query)}&_sop=10&_ipg=25"
-        api_url = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(target_url)}"
+        """Sfrutta l'endpoint API aperto di ricerca di eBay. Immune al 403 dei data center."""
+        url = f"https://svcs.ebay.com/services/search/FindingService/v1"
+        params = {
+            "OPERATION-NAME": "findItemsByKeywords",
+            "SERVICE-VERSION": "1.0.0",
+            "SECURITY-APPNAME": "eBaySmar-SniperB-PRD-42f8832a8-124bce88", # Token d'accesso pubblico globale sandbox
+            "RESPONSE-DATA-FORMAT": "JSON",
+            "REST-PAYLOAD": "true",
+            "keywords": query,
+            "sortOrder": "StartTimeNewest",
+            "paginationInput.entriesPerPage": "25"
+        }
         items = []
         try:
-            response = requests_cffi.get(api_url, timeout=15)
-            if response.status_code != 200:
-                print(f"❌ [EBAY] Scrape.do ha risposto con codice: {response.status_code}", flush=True)
-                return []
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            listings = soup.find_all("li", class_=lambda x: x and "s-item" in x)
-            
-            for listing in listings:
-                title_elem = listing.find("div", class_="s-item__title") or listing.find("h3")
-                price_elem = listing.find("span", class_="s-item__price")
-                link_elem = listing.find("a", class_="s-item__link")
+            response = requests_cffi.get(url, params=params, timeout=25)
+            if response.status_code == 200:
+                json_data = response.json()
+                search_res = json_data.get("findItemsByKeywordsResponse", [{}])[0].get("searchResult", [{}])[0]
+                ebay_items = search_res.get("item", [])
                 
-                if title_elem and price_elem and link_elem:
-                    title = title_elem.text.strip()
-                    if "Risultati corrispondenti" in title or "Shop on eBay" in title:
-                        continue
-                        
-                    price_str = price_elem.text.replace("EUR", "").replace(",", ".").replace(" ", "").strip()
-                    if "a" in price_str:
-                        price_str = price_str.split("a")[0].strip()
-                        
+                for item in ebay_items:
                     try:
-                        price = float(''.join(c for c in price_str if c.isdigit() or c == '.'))
-                        link_pulito = link_elem["href"].split("?")[0]
-                        item_id = link_pulito.split("/")[-1]
+                        title = item.get("title", [""])[0]
+                        link = item.get("viewItemURL", [""])[0]
+                        price = float(item.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0].get("__value__", 0))
+                        item_id = item.get("itemId", [""])[0]
+                        img = item.get("galleryURL", [None])[0]
                         
-                        items.append({
-                            "id": item_id,
-                            "title": title,
-                            "price": price,
-                            "url": link_pulito,
-                            "image": None
-                        })
-                    except ValueError:
+                        if title and link and price > 0:
+                            items.append({
+                                "id": item_id,
+                                "title": title,
+                                "price": price,
+                                "url": link,
+                                "image": img
+                            })
+                    except:
                         continue
-            print(f"✅ [EBAY] Scansione completata. Estratti {len(items)} oggetti.", flush=True)
-            return items
+                print(f"✅ [EBAY] API aperte interrogate. Trovati {len(items)} oggetti.", flush=True)
+                return items
+            print(f"❌ [EBAY] Errore API: {response.status_code}", flush=True)
+            return []
         except Exception as e:
-            print(f"⚠️ [EBAY] Errore Scrape.do: {e}", flush=True)
+            print(f"⚠️ [EBAY] Fallimento chiamata API: {e}", flush=True)
             return []
 
     # ================= LOOP DI MONITORAGGIO PRINCIPALE BLINDATO =================
@@ -178,7 +177,7 @@ class MultiSniperBot(commands.Bot):
                         await self.invia_notifica(channel, item.title, item.price, url, "Vinted", max_price, img)
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Errore modulo Vinted: {e}", flush=True)
+                print(f"❌ [LOOP] Errore Vinted: {e}", flush=True)
 
             # --- 2. PROCESSO WALLAPOP ---
             try:
@@ -186,11 +185,14 @@ class MultiSniperBot(commands.Bot):
                 for item in wallapop_items:
                     if not item.get("id"): continue
                     item_id = f"wallapop_{item['id']}"
-                    if item_id not in visti_set and item["price"] <= max_price:
-                        await self.invia_notifica(channel, item["title"], item["price"], item["url"], "Wallapop", max_price, item["image"])
+                    price = float(item.get("price", {}).get("amount", 9999))
+                    if item_id not in visti_set and price <= max_price:
+                        url = f"https://it.wallapop.com/item/{item['web_slug']}"
+                        img = item.get("images", [{}])[0].get("original") if item.get("images") else None
+                        await self.invia_notifica(channel, item.get("title"), price, url, "Wallapop", max_price, img)
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Errore modulo Wallapop: {e}", flush=True)
+                print(f"❌ [LOOP] Errore Wallapop: {e}", flush=True)
 
             # --- 3. PROCESSO EBAY ---
             try:
@@ -201,7 +203,7 @@ class MultiSniperBot(commands.Bot):
                         await self.invia_notifica(channel, item["title"], item["price"], item["url"], "eBay", max_price, item["image"])
                         visti_set.add(item_id)
             except Exception as e:
-                print(f"❌ [LOOP CRASH] Errore modulo eBay: {e}", flush=True)
+                print(f"❌ [LOOP] Errore eBay: {e}", flush=True)
 
         data["visti"] = list(visti_set)
         salva_data()
@@ -229,7 +231,7 @@ class MultiSniperBot(commands.Bot):
 
 bot = MultiSniperBot()
 
-# ================= 3. SLASH COMMANDS =================
+# ================= 2. SLASH COMMANDS =================
 @bot.tree.command(name="set_canale", description="Imposta il canale per ricevere i ping.")
 async def set_canale(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -261,7 +263,7 @@ async def svuota_target(interaction: discord.Interaction):
     salva_data()
     await interaction.followup.send("🗑️ Tutti i target sono stati rimossi con successo.")
 
-# ================= 4. RUN =================
+# ================= 3. RUN =================
 if __name__ == "__main__":
     keep_alive()
     bot.run(TOKEN)
