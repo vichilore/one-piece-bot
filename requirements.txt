@@ -1,0 +1,5 @@
+discord.py
+vinted-scraper
+beautifulsoup4
+curl_cffi
+flask
